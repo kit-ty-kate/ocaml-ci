@@ -60,12 +60,14 @@ let set_active_refs ~repo xs =
   );
   xs
 
-type 'a state_result = ('a, [`Active of Current_term.Output.active | `Msg of string]) result
-type job = (string * ([`Built | `Checked] state_result * Current.job_id option))
+type job = (string * ([`Built | `Checked] Current.t * Current.job_id option Current.t))
 type pipeline =
   | Skip
   | Job of job
   | Stage of pipeline Current.t list
+
+let job_id job =
+  (job, Current.Analysis.metadata job)
 
 let build_with_docker ~repo ~analysis source =
   let pipeline =
@@ -77,24 +79,19 @@ let build_with_docker ~repo ~analysis source =
     let platforms = Current.return platforms in
     let builds = platforms |> Current.list_map (module Platform) (fun platform ->
       let job = Opam_build.v ~platform ~schedule:weekly ~repo ~analysis source in
-      let+ result = Current.state ~hidden:true job
-      and+ job_id = Current.Analysis.metadata job
-      and+ platform = platform in
-      Current.return (Job (platform.label, (result, job_id)))
+      let+ platform = platform in
+      Current.return (Job (platform.label, job_id job))
     ) in
-    let+ builds = builds
-    and+ lint_result = Current.state ~hidden:true lint_job
-    and+ job_id = Current.Analysis.metadata lint_job in
+    let+ builds = builds in
     Stage (
       builds @ [
-        Current.return (Job ("lint", (lint_result, job_id)));
+        Current.return (Job ("lint", job_id lint_job));
       ]
     )
   in
-  let+ analysis_job = Current.state ~hidden:true (Current.map (fun _ -> `Checked) analysis)
-  and+ job_id = Current.Analysis.metadata analysis in
+  let analysis_job = Current.map (fun _ -> `Checked) analysis in
   Stage [
-    Current.return (Job ("(analysis)", (analysis_job, job_id)));
+    Current.return (Job ("(analysis)", job_id analysis_job));
     pipeline;
   ]
 
@@ -118,6 +115,13 @@ let list_errors ~ok errs =
     ))
 
 let summarise results =
+  results
+  |> List.map (fun (label, build) ->
+      let+ result = Current.state ~hidden:true build in
+      (label, result)
+    )
+  |> Current.list_seq
+  |> Current.map @@ fun results ->
   results |> List.fold_left (fun (ok, pending, err, skip) -> function
       | _, Ok `Checked -> (ok, pending, err, skip)  (* Don't count lint checks *)
       | _, Ok `Built -> (ok + 1, pending, err, skip)
@@ -132,25 +136,25 @@ let summarise results =
     | _, [], _ -> Ok ()                     (* No errors and at least one success *)
     | ok, err, _ -> list_errors ~ok err     (* Some errors found - report *)
 
-let rec get_jobs_aux f builds =
-  let* builds = builds in
-  match builds with
+let rec get_jobs_aux f = function
   | Skip -> Current.return []
-  | Job job -> Current.return [f job]
+  | Job job -> Current.map (fun job -> [job]) (f job)
   | Stage stages ->
       List.fold_left (fun acc stage ->
+        let* stage = stage in
         let+ stage = get_jobs_aux f stage
         and+ acc = acc in
         stage @ acc
       ) (Current.return []) stages
 
 let summarise builds =
-  let get_job (variant, (build, _job)) = (variant, build) in
-  let+ jobs = get_jobs_aux get_job builds in
+  let get_job (variant, (build, _job)) = Current.return (variant, build) in
+  Current.component "summarise" |>
+  let** jobs = get_jobs_aux get_job builds in
   summarise jobs
 
 let get_jobs builds =
-  let get_job (variant, (_build, job)) = (variant, job) in
+  let get_job (variant, (_build, job)) = Current.map (fun job -> (variant, job)) job in
   get_jobs_aux get_job builds
 
 let local_test repo () =

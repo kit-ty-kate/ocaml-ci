@@ -64,7 +64,8 @@ type job = (string * ([`Built | `Checked] Current.t * Current.job_id option Curr
 type pipeline =
   | Skip
   | Job of job
-  | Stage of pipeline Current.t list
+  | Dynamic of pipeline Current.t
+  | Stage of pipeline list
 
 let job_id job =
   (job, Current.Analysis.metadata job)
@@ -80,19 +81,19 @@ let build_with_docker ~repo ~analysis source =
     let builds = platforms |> Current.list_map (module Platform) (fun platform ->
       let job = Opam_build.v ~platform ~schedule:weekly ~repo ~analysis source in
       let+ platform = platform in
-      Current.return (Job (platform.label, job_id job))
+      Job (platform.label, job_id job)
     ) in
     let+ builds = builds in
     Stage (
       builds @ [
-        Current.return (Job ("lint", job_id lint_job));
+        Job ("lint", job_id lint_job);
       ]
     )
   in
   let analysis_job = Current.map (fun _ -> `Checked) analysis in
   Stage [
-    Current.return (Job ("(analysis)", job_id analysis_job));
-    pipeline;
+    Job ("(analysis)", job_id analysis_job);
+    Dynamic pipeline;
   ]
 
 let list_errors ~ok errs =
@@ -139,9 +140,9 @@ let summarise results =
 let rec get_jobs_aux f = function
   | Skip -> Current.return []
   | Job job -> Current.map (fun job -> [job]) (f job)
+  | Dynamic pipeline -> Current.bind (get_jobs_aux f) pipeline
   | Stage stages ->
       List.fold_left (fun acc stage ->
-        let* stage = stage in
         let+ stage = get_jobs_aux f stage
         and+ acc = acc in
         stage @ acc

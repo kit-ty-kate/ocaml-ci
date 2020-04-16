@@ -60,25 +60,42 @@ let set_active_refs ~repo xs =
   );
   xs
 
+type 'a state_result = ('a, [`Active of Current_term.Output.active | `Msg of string]) result
+type job = (string * ([`Built | `Checked] state_result * Current.job_id option))
+type pipeline =
+  | Skip
+  | Job of job
+  | Stage of pipeline Current.t list
+
 let build_with_docker ~repo ~analysis source =
-  Current.with_context analysis @@ fun () ->
-  let lint_job = Ocaml_ci.Lint.v ~builder:lint_builder ~schedule:weekly ~analysis ~source in
-  (* At the moment, we know the set of platforms statically. However, we're pretending
-     it's dynamic here in anticipation of future changes where the set of platforms
-     to use comes from the analysis phase. *)
-  let platforms = Current.return platforms in
-  let builds = platforms |> Current.list_map (module Platform) (fun platform ->
+  let pipeline =
+    Current.with_context analysis @@ fun () ->
+    let lint_job = Ocaml_ci.Lint.v ~builder:lint_builder ~schedule:weekly ~analysis ~source in
+    (* At the moment, we know the set of platforms statically. However, we're pretending
+       it's dynamic here in anticipation of future changes where the set of platforms
+       to use comes from the analysis phase. *)
+    let platforms = Current.return platforms in
+    let builds = platforms |> Current.list_map (module Platform) (fun platform ->
       let job = Opam_build.v ~platform ~schedule:weekly ~repo ~analysis source in
       let+ result = Current.state ~hidden:true job
       and+ job_id = Current.Analysis.metadata job
       and+ platform = platform in
-      platform.label, (result, job_id)
+      Current.return (Job (platform.label, (result, job_id)))
     ) in
-  let+ builds = builds
-  and+ lint_result = Current.state ~hidden:true lint_job
-  and+ job_id = Current.Analysis.metadata lint_job in
-  builds @ [
-    "lint", (lint_result, job_id);
+    let+ builds = builds
+    and+ lint_result = Current.state ~hidden:true lint_job
+    and+ job_id = Current.Analysis.metadata lint_job in
+    Stage (
+      builds @ [
+        Current.return (Job ("lint", (lint_result, job_id)));
+      ]
+    )
+  in
+  let+ analysis_job = Current.state ~hidden:true (Current.map (fun _ -> `Checked) analysis)
+  and+ job_id = Current.Analysis.metadata analysis in
+  Stage [
+    Current.return (Job ("(analysis)", (analysis_job, job_id)));
+    pipeline;
   ]
 
 let list_errors ~ok errs =
@@ -115,18 +132,37 @@ let summarise results =
     | _, [], _ -> Ok ()                     (* No errors and at least one success *)
     | ok, err, _ -> list_errors ~ok err     (* Some errors found - report *)
 
+let rec get_jobs_aux f builds =
+  let* builds = builds in
+  match builds with
+  | Skip -> Current.return []
+  | Job job -> Current.return [f job]
+  | Stage stages ->
+      List.fold_left (fun acc stage ->
+        let+ stage = get_jobs_aux f stage
+        and+ acc = acc in
+        stage @ acc
+      ) (Current.return []) stages
+
+let summarise builds =
+  let get_job (variant, (build, _job)) = (variant, build) in
+  let+ jobs = get_jobs_aux get_job builds in
+  summarise jobs
+
+let get_jobs builds =
+  let get_job (variant, (_build, job)) = (variant, job) in
+  get_jobs_aux get_job builds
+
 let local_test repo () =
   let src = Git.Local.head_commit repo in
   let repo = Current.return { Github.Repo_id.owner = "local"; name = "test" }
   and analysis = Analyse.examine src in
   Current.component "summarise" |>
-  let> results = build_with_docker ~repo ~analysis src in
-  let result =
-    results
-    |> List.map (fun (variant, (build, _job)) -> variant, build)
-    |> summarise
+  let** result =
+    build_with_docker ~repo ~analysis src |>
+    summarise
   in
-  Current_incr.const (result, None)
+  Current.of_output result
 
 let v ~app () =
   Github.App.installations app |> Current.list_iter ~collapse_key:"org" (module Github.Installation) @@ fun installation ->
@@ -139,27 +175,21 @@ let v ~app () =
   let builds =
     let repo = Current.map Github.Api.Repo.id repo in
     build_with_docker ~repo ~analysis src in
-  let summary =
-    builds
-    |> Current.map (List.map (fun (variant, (build, _job)) -> variant, build))
-    |> Current.map summarise
-  in
+  let summary = summarise builds in
   let status =
     let+ summary = summary in
     match summary with
     | Ok () -> `Passed
-    | Error (`Active `Running) -> `Pending
+    | Error (`Active _) -> `Pending
     | Error (`Msg _) -> `Failed
   in
   let index =
     let+ commit = head
-    and+ analysis = Current.Analysis.metadata analysis
-    and+ builds = builds
+    and+ jobs = get_jobs builds
     and+ status = status in
     let repo = Current_github.Api.Commit.repo_id commit in
     let hash = Current_github.Api.Commit.hash commit in
-    let jobs = builds |> List.map (fun (variant, (_, job_id)) -> (variant, job_id)) in
-    Index.record ~repo ~hash ~status @@ ("(analysis)", analysis) :: jobs
+    Index.record ~repo ~hash ~status jobs
   and set_github_status =
     summary
     |> github_status_of_state ~head
